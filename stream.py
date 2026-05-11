@@ -15,11 +15,12 @@ import cv2
 # ─── 設定 ─────────────────────────────────────────────────────────────────────
 WINDOW_TITLE = "ADB Stream (H264)"
 SCALE_FACTOR = 0.45          # 顯示縮放比 (0.15 ~ 1.5)
-BITRATE      = "8M"          # 串流位元率 (越高越清晰但越吃頻寬)
+BITRATE      = "6M"          # 串流位元率 (越高越清晰但越吃頻寬)
 HUD_TOP      = 36            # 頂部 HUD 高度 px
 HUD_BOTTOM   = 26            # 底部 HUD 高度 px
 ADB_CMD      = "adb"         # 若 adb 不在 PATH，改為完整路徑
 FFMPEG_CMD   = "ffmpeg"      # 若 ffmpeg 不在 PATH，改為完整路徑
+READ_BATCH_FRAMES = 6        # 一次盡量多讀幾幀，只保留最新幀以降低延遲
 
 # 顏色 (BGR)
 C_GREEN  = (0, 255, 120)
@@ -40,12 +41,15 @@ class H264Streamer:
         self.device_id  = None
         self.phone_w    = 0
         self.phone_h    = 0
-        self.scaled_w   = 0
-        self.scaled_h   = 0
+        self.capture_w  = 0
+        self.capture_h  = 0
+        self.display_w  = 0
+        self.display_h  = 0
         self.frame_size = 0
         self.adb_proc   = None
         self.ff_proc    = None
         self.error_msg  = None
+        self.raw_buffer = bytearray()
 
         # 滑鼠狀態
         self.mouse_x    = 0
@@ -81,34 +85,54 @@ class H264Streamer:
     def _kill_procs(self):
         for proc in (self.ff_proc, self.adb_proc):
             if proc:
+                for pipe in (proc.stdin, proc.stdout):
+                    if pipe:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
                 try:
                     proc.kill()
+                    proc.wait(timeout=0.5)
                 except Exception:
                     pass
         self.ff_proc = self.adb_proc = None
+        self.raw_buffer.clear()
+
+    @staticmethod
+    def _even_size(value: int) -> int:
+        value = max(2, value)
+        return value if value % 2 == 0 else value - 1
 
     def start_stream(self) -> bool:
         """啟動 ADB screenrecord | FFmpeg 解碼管道"""
         self._kill_procs()
 
-        # 計算縮放後尺寸（必須為偶數）
-        sw = int(self.phone_w * SCALE_FACTOR)
-        sh = int(self.phone_h * SCALE_FACTOR)
-        self.scaled_w = sw - (sw % 2)
-        self.scaled_h = sh - (sh % 2)
-        self.frame_size = self.scaled_w * self.scaled_h * 3  # BGR = 3 bytes/px
+        # 顯示尺寸可以放大，但串流擷取尺寸不超過手機原生解析度
+        self.display_w = self._even_size(int(self.phone_w * SCALE_FACTOR))
+        self.display_h = self._even_size(int(self.phone_h * SCALE_FACTOR))
+
+        capture_scale = min(SCALE_FACTOR, 1.0)
+        self.capture_w = self._even_size(int(self.phone_w * capture_scale))
+        self.capture_h = self._even_size(int(self.phone_h * capture_scale))
+        self.frame_size = self.capture_w * self.capture_h * 3  # BGR = 3 bytes/px
 
         adb_cmd = self._adb([
             "exec-out", "screenrecord",
             "--output-format=h264",
             f"--bit-rate={BITRATE}",
+            "--size", f"{self.capture_w}x{self.capture_h}",
             "-",
         ])
 
         ff_cmd = [
-            FFMPEG_CMD, "-loglevel", "quiet",
+            FFMPEG_CMD, "-loglevel", "error",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-analyzeduration", "0",
+            "-probesize", "32",
+            "-f", "h264",
             "-i", "pipe:0",
-            "-vf", f"scale={self.scaled_w}:{self.scaled_h}",
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "pipe:1",
@@ -124,12 +148,42 @@ class H264Streamer:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+            if self.adb_proc.stdout:
+                self.adb_proc.stdout.close()
             return True
         except FileNotFoundError as e:
             print(f"❌ 找不到執行檔：{e}")
             return False
 
     # ── 背景擷取執行緒 ────────────────────────────────────────────────────────
+    def _read_latest_frame(self) -> bytes | None:
+        if self.ff_proc is None or self.ff_proc.stdout is None:
+            return None
+
+        try:
+            raw = self.ff_proc.stdout.read1(self.frame_size * READ_BATCH_FRAMES)
+        except Exception:
+            return b""
+
+        if not raw:
+            return b""
+
+        self.raw_buffer.extend(raw)
+        if len(self.raw_buffer) < self.frame_size:
+            return None
+
+        remainder = len(self.raw_buffer) % self.frame_size
+        frame_end = len(self.raw_buffer) - remainder
+        frame_start = frame_end - self.frame_size
+        latest_frame = bytes(self.raw_buffer[frame_start:frame_end])
+
+        if remainder:
+            self.raw_buffer = bytearray(self.raw_buffer[-remainder:])
+        else:
+            self.raw_buffer.clear()
+
+        return latest_frame
+
     def capture_loop(self):
         fps_timer = time.time()
         count = 0
@@ -143,10 +197,8 @@ class H264Streamer:
                 time.sleep(1.0)
                 continue
 
-            try:
-                raw = self.ff_proc.stdout.read(self.frame_size)
-            except Exception:
-                time.sleep(0.2)
+            raw = self._read_latest_frame()
+            if raw is None:
                 continue
 
             if len(raw) != self.frame_size:
@@ -156,10 +208,23 @@ class H264Streamer:
                 continue
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-                (self.scaled_h, self.scaled_w, 3)
+                (self.capture_h, self.capture_w, 3)
             )
+
+            if (self.capture_w, self.capture_h) != (self.display_w, self.display_h):
+                interpolation = (
+                    cv2.INTER_LINEAR
+                    if self.display_w >= self.capture_w
+                    else cv2.INTER_AREA
+                )
+                frame = cv2.resize(
+                    frame,
+                    (self.display_w, self.display_h),
+                    interpolation=interpolation,
+                )
+
             with self.lock:
-                self.frame = frame.copy()
+                self.frame = frame
 
             count += 1
             self.error_msg = None
@@ -174,15 +239,15 @@ class H264Streamer:
     def screen_to_phone(self, sx: int, sy: int) -> tuple[int, int]:
         """將顯示視窗座標轉換為手機實際座標"""
         adj_y = sy - HUD_TOP
-        px = int(sx / SCALE_FACTOR)
-        py = int(adj_y / SCALE_FACTOR)
+        px = int(sx * self.phone_w / max(self.display_w, 1))
+        py = int(adj_y * self.phone_h / max(self.display_h, 1))
         px = max(0, min(px, self.phone_w - 1))
         py = max(0, min(py, self.phone_h - 1))
         return px, py
 
     def in_phone_area(self, sy: int) -> bool:
         """判斷座標是否在手機畫面區域（非 HUD）"""
-        canvas_h = self.scaled_h + HUD_TOP + HUD_BOTTOM
+        canvas_h = self.display_h + HUD_TOP + HUD_BOTTOM
         return HUD_TOP <= sy <= (canvas_h - HUD_BOTTOM)
 
     # ── ADB 輸入指令 ──────────────────────────────────────────────────────────
@@ -354,7 +419,7 @@ class H264Streamer:
 
         while self.running:
             with self.lock:
-                frame = self.frame.copy() if self.frame is not None else None
+                frame = self.frame
 
             if frame is None:
                 time.sleep(0.02)

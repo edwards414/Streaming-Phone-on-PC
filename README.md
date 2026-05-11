@@ -13,6 +13,7 @@
 | 滑動同步 | 滑鼠拖曳 → 同步發送 `input swipe` 到手機 |
 | 滾輪同步 | 滾輪上下 → 換算為手機滾動手勢 |
 | 自動重連 | 串流中斷（如 3 分鐘截止）自動重啟管道 |
+| 低延遲優化 | 手機端先縮放輸出，接收端只保留最新畫面 |
 | 縮放調整 | 即時調整顯示比例並重啟串流 |
 | 截圖存檔 | 一鍵截圖存為 PNG |
 | Android 按鍵 | 鍵盤 B / H 對應手機返回 / 主畫面鍵 |
@@ -120,7 +121,7 @@ Android 手機
          │
          ▼
       FFmpeg
-    └─ 接收 pipe:0 → 解碼 H264 → 縮放 → 輸出 raw BGR24 到 pipe:1
+    └─ 接收 pipe:0 → 低延遲解碼 H264 → 輸出 raw BGR24 到 pipe:1
          │
          ▼
    Python (numpy)
@@ -167,7 +168,7 @@ if self.ff_proc is None or self.ff_proc.poll() is not None:
 | 執行緒 | 職責 |
 |--------|------|
 | 主執行緒 | OpenCV 視窗渲染、鍵盤/滑鼠事件處理 |
-| `capture_loop`（daemon） | 從 FFmpeg stdout 持續讀取 raw frame |
+| `capture_loop`（daemon） | 從 FFmpeg stdout 持續讀取 raw frame，若累積多幀則只保留最新幀 |
 
 兩者透過 `threading.Lock` 保護共享的 `self.frame`，避免 race condition。
 
@@ -179,7 +180,7 @@ if self.ff_proc is None or self.ff_proc.poll() is not None:
 
 ```python
 SCALE_FACTOR = 0.45   # 顯示縮放比 (0.15 ~ 1.5)
-BITRATE      = "8M"   # H264 位元率（越高越清晰，越吃 USB 頻寬）
+BITRATE      = "6M"   # H264 位元率（越高越清晰，越吃 USB 頻寬）
 HUD_TOP      = 36     # 頂部 HUD 高度（px）
 HUD_BOTTOM   = 26     # 底部 HUD 高度（px）
 ADB_CMD      = "adb"  # ADB 執行檔路徑
@@ -189,7 +190,7 @@ FFMPEG_CMD   = "ffmpeg"  # FFmpeg 執行檔路徑
 | 參數 | 建議值 | 說明 |
 |------|--------|------|
 | `SCALE_FACTOR` | `0.4` ~ `0.6` | 越小越流暢，越大越清晰 |
-| `BITRATE` | `4M` ~ `12M` | USB 2.0 建議 `6M`；USB 3.0 可用 `12M` |
+| `BITRATE` | `4M` ~ `12M` | USB 2.0 建議從 `6M` 開始；USB 3.0 可逐步拉高 |
 
 ---
 
