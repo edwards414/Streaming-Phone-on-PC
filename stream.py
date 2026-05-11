@@ -50,6 +50,8 @@ class H264Streamer:
         self.ff_proc    = None
         self.error_msg  = None
         self.raw_buffer = bytearray()
+        self.stream_lock = threading.Lock()
+        self.use_device_resize = True
 
         # 滑鼠狀態
         self.mouse_x    = 0
@@ -104,56 +106,82 @@ class H264Streamer:
         value = max(2, value)
         return value if value % 2 == 0 else value - 1
 
-    def start_stream(self) -> bool:
+    def start_stream(self, device_resize: bool | None = None) -> bool:
         """啟動 ADB screenrecord | FFmpeg 解碼管道"""
-        self._kill_procs()
+        with self.stream_lock:
+            if device_resize is None:
+                device_resize = self.use_device_resize
+            self.use_device_resize = device_resize
 
-        # 顯示尺寸可以放大，但串流擷取尺寸不超過手機原生解析度
-        self.display_w = self._even_size(int(self.phone_w * SCALE_FACTOR))
-        self.display_h = self._even_size(int(self.phone_h * SCALE_FACTOR))
+            self._kill_procs()
+            with self.lock:
+                self.frame = None
 
-        capture_scale = min(SCALE_FACTOR, 1.0)
-        self.capture_w = self._even_size(int(self.phone_w * capture_scale))
-        self.capture_h = self._even_size(int(self.phone_h * capture_scale))
-        self.frame_size = self.capture_w * self.capture_h * 3  # BGR = 3 bytes/px
+            # 顯示尺寸可以放大，但串流擷取尺寸不超過手機原生解析度
+            self.display_w = self._even_size(int(self.phone_w * SCALE_FACTOR))
+            self.display_h = self._even_size(int(self.phone_h * SCALE_FACTOR))
 
-        adb_cmd = self._adb([
-            "exec-out", "screenrecord",
-            "--output-format=h264",
-            f"--bit-rate={BITRATE}",
-            "--size", f"{self.capture_w}x{self.capture_h}",
-            "-",
-        ])
+            adb_cmd = self._adb([
+                "exec-out", "screenrecord",
+                "--output-format=h264",
+                f"--bit-rate={BITRATE}",
+            ])
 
-        ff_cmd = [
-            FFMPEG_CMD, "-loglevel", "error",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-analyzeduration", "0",
-            "-probesize", "32",
-            "-f", "h264",
-            "-i", "pipe:0",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "pipe:1",
-        ]
+            ff_cmd = [FFMPEG_CMD, "-loglevel", "error"]
 
-        try:
-            self.adb_proc = subprocess.Popen(
-                adb_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            self.ff_proc = subprocess.Popen(
-                ff_cmd,
-                stdin=self.adb_proc.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            if self.adb_proc.stdout:
-                self.adb_proc.stdout.close()
-            return True
-        except FileNotFoundError as e:
-            print(f"❌ 找不到執行檔：{e}")
+            if device_resize:
+                capture_scale = min(SCALE_FACTOR, 1.0)
+                self.capture_w = self._even_size(int(self.phone_w * capture_scale))
+                self.capture_h = self._even_size(int(self.phone_h * capture_scale))
+                adb_cmd += ["--size", f"{self.capture_w}x{self.capture_h}"]
+                ff_cmd += [
+                    "-fflags", "nobuffer",
+                    "-flags", "low_delay",
+                    "-analyzeduration", "0",
+                    "-probesize", "32",
+                    "-f", "h264",
+                ]
+            else:
+                self.capture_w = self.display_w
+                self.capture_h = self.display_h
+
+            ff_cmd += ["-i", "pipe:0"]
+
+            if not device_resize:
+                ff_cmd += ["-vf", f"scale={self.display_w}:{self.display_h}"]
+
+            adb_cmd.append("-")
+            ff_cmd += [
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "pipe:1",
+            ]
+            self.frame_size = self.capture_w * self.capture_h * 3  # BGR = 3 bytes/px
+
+            try:
+                self.adb_proc = subprocess.Popen(
+                    adb_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                self.ff_proc = subprocess.Popen(
+                    ff_cmd,
+                    stdin=self.adb_proc.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                if self.adb_proc.stdout:
+                    self.adb_proc.stdout.close()
+                return True
+            except FileNotFoundError as e:
+                print(f"❌ 找不到執行檔：{e}")
+                return False
+
+    def fallback_to_ffmpeg_resize(self) -> bool:
+        if not self.use_device_resize:
             return False
+
+        print("⚠ 手機端縮放沒有輸出畫面，改用 FFmpeg 縮放模式...")
+        self.error_msg = "⚠ 改用相容模式..."
+        return self.start_stream(device_resize=False)
 
     # ── 背景擷取執行緒 ────────────────────────────────────────────────────────
     def _read_latest_frame(self) -> bytes | None:
@@ -193,7 +221,8 @@ class H264Streamer:
             if self.ff_proc is None or self.ff_proc.poll() is not None:
                 print("🔄 串流中斷，自動重啟...")
                 self.error_msg = "🔄 重新連接中..."
-                self.start_stream()
+                if not self.fallback_to_ffmpeg_resize():
+                    self.start_stream()
                 time.sleep(1.0)
                 continue
 
@@ -203,7 +232,8 @@ class H264Streamer:
 
             if len(raw) != self.frame_size:
                 self.error_msg = "⚠ 串流中斷，重新連接..."
-                self.start_stream()
+                if not self.fallback_to_ffmpeg_resize():
+                    self.start_stream()
                 time.sleep(1.0)
                 continue
 
@@ -349,6 +379,15 @@ class H264Streamer:
 
         return canvas
 
+    def wait_for_first_frame(self, timeout_s: float) -> bool:
+        deadline = time.time() + timeout_s
+        while self.running and time.time() < deadline:
+            with self.lock:
+                if self.frame is not None:
+                    return True
+            time.sleep(0.1)
+        return False
+
     # ── 主迴圈 ───────────────────────────────────────────────────────────────
     def run(self):
         global SCALE_FACTOR
@@ -398,14 +437,13 @@ class H264Streamer:
 
         # ── 等待第一幀
         print("⏳ 等待第一幀...")
-        for _ in range(50):
-            with self.lock:
-                if self.frame is not None:
-                    break
-            time.sleep(0.3)
-        else:
+        got_frame = self.wait_for_first_frame(5.0)
+        if not got_frame and self.fallback_to_ffmpeg_resize():
+            got_frame = self.wait_for_first_frame(12.0)
+
+        if not got_frame:
             print("❌ 超時：無法取得畫面")
-            print("  請確認 FFmpeg 版本支援 H264，或嘗試降低 BITRATE 設定")
+            print("  請確認 USB 偵錯授權、手機是否解鎖，或嘗試降低 BITRATE 設定")
             self.running = False
             self._kill_procs()
             sys.exit(1)

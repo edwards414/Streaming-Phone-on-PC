@@ -13,7 +13,7 @@
 | 滑動同步 | 滑鼠拖曳 → 同步發送 `input swipe` 到手機 |
 | 滾輪同步 | 滾輪上下 → 換算為手機滾動手勢 |
 | 自動重連 | 串流中斷（如 3 分鐘截止）自動重啟管道 |
-| 低延遲優化 | 手機端先縮放輸出，接收端只保留最新畫面 |
+| 低延遲優化 | 優先手機端先縮放輸出，不支援時自動切回 FFmpeg 縮放 |
 | 縮放調整 | 即時調整顯示比例並重啟串流 |
 | 截圖存檔 | 一鍵截圖存為 PNG |
 | Android 按鍵 | 鍵盤 B / H 對應手機返回 / 主畫面鍵 |
@@ -87,6 +87,12 @@ adb devices
 
 ```powershell
 python stream.py
+```
+
+## 測試
+
+```powershell
+python -m unittest discover -s tests
 ```
 
 ---
@@ -169,6 +175,8 @@ if self.ff_proc is None or self.ff_proc.poll() is not None:
 |--------|------|
 | 主執行緒 | OpenCV 視窗渲染、鍵盤/滑鼠事件處理 |
 | `capture_loop`（daemon） | 從 FFmpeg stdout 持續讀取 raw frame，若累積多幀則只保留最新幀 |
+
+部分 Android 裝置不支援任意 `screenrecord --size` 解析度。程式會先嘗試手機端縮放；若啟動時沒有收到畫面，會自動改用相容性較高的 FFmpeg 縮放模式。
 
 兩者透過 `threading.Lock` 保護共享的 `self.frame`，避免 race condition。
 
